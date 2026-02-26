@@ -211,26 +211,23 @@ func (l *Service) StartListeningTracker(interval time.Duration) {
 			l.logger.Println("Skipping initial fetch cycle as no users are configured.")
 		}
 
-		for {
-			select {
-			case <-ticker.C:
-				// refresh usernames periodically from db
-				if err := l.loadUsernames(); err != nil {
-					l.logger.Printf("Error reloading usernames in ticker: %v", err)
-					// Continue ticker loop even if reload fails? Or log and potentially stop?
-					continue // Continue for now
-				}
-				if len(l.Usernames) > 0 {
-					l.fetchAllUserTracks(context.Background())
-				} else {
-					l.logger.Println("No Last.fm users configured. Skipping fetch cycle.")
-				}
-				// TODO: Implement graceful shutdown using context cancellation
-				// case <-ctx.Done():
-				//  l.logger.Println("Stopping Last.fm listening tracker.")
-				//	ticker.Stop()
-				//  return
+		for range ticker.C {
+			// refresh usernames periodically from db
+			if err := l.loadUsernames(); err != nil {
+				l.logger.Printf("Error reloading usernames in ticker: %v", err)
+				// Continue ticker loop even if reload fails? Or log and potentially stop?
+				continue // Continue for now
 			}
+			if len(l.Usernames) > 0 {
+				l.fetchAllUserTracks(context.Background())
+			} else {
+				l.logger.Println("No Last.fm users configured. Skipping fetch cycle.")
+			}
+			// TODO: Implement graceful shutdown using context cancellation
+			// case <-ctx.Done():
+			//  l.logger.Println("Stopping Last.fm listening tracker.")
+			//	ticker.Stop()
+			//  return
 		}
 	}()
 

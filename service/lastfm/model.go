@@ -16,6 +16,41 @@ type RecentTracks struct {
 	Attr   TrackXMLAttr `json:"@attr"`
 }
 
+// Custom JSON unmarshaller for RecentTracks to handle the case where "track"
+// can be either an array or a single object.
+func (rt *RecentTracks) UnmarshalJSON(data []byte) error {
+	// Last.fm returns "track" as an array when there are multiple tracks,
+	// but as a single object when there is only one track.
+	type Alias RecentTracks
+	aux := &struct {
+		Tracks json.RawMessage `json:"track"`
+		*Alias
+	}{
+		Alias: (*Alias)(rt),
+	}
+
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+
+	if len(aux.Tracks) == 0 {
+		return nil
+	}
+
+	// Try array first
+	if aux.Tracks[0] == '[' {
+		return json.Unmarshal(aux.Tracks, &rt.Tracks)
+	}
+
+	// Single object
+	var single Track
+	if err := json.Unmarshal(aux.Tracks, &single); err != nil {
+		return err
+	}
+	rt.Tracks = []Track{single}
+	return nil
+}
+
 type Track struct {
 	Artist     Artist     `json:"artist"`
 	Streamable string     `json:"streamable"` // Typically "0" or "1"

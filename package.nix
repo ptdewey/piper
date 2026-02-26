@@ -1,8 +1,9 @@
 { lib, buildGoModule, tailwindcss_4, fetchFromGitHub, source ? fetchFromGitHub {
   owner = "teal-fm";
   repo = "piper";
-  rev = "9920d5900c7cc317170bed1c54ea323879eba83c";
-  hash = "sha256-k00Wkt7uhSZoxAz76IGEYpRDJLKhXT4eSGtdHvFp8jU=";
+  # rev = "9920d5900c7cc317170bed1c54ea323879eba83c";
+  # hash = "sha256-k00Wkt7uhSZoxAz76IGEYpRDJLKhXT4eSGtdHvFp8jU=";
+
 } }:
 buildGoModule {
   pname = "tealfm-piper";
