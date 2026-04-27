@@ -1,8 +1,21 @@
-{ self ? null }:
-{ config, lib, pkgs, ... }:
+{
+  self ? null,
+}:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
-  inherit (lib) mkEnableOption mkIf mkOption types literalExpression;
+  inherit (lib)
+    mkEnableOption
+    mkIf
+    mkOption
+    types
+    literalExpression
+    ;
 
   cfg = config.services.tealfm-piper;
 
@@ -27,22 +40,27 @@ let
     ALLOWED_DIDS = lib.concatStringsSep " " cfg.settings.ALLOWED_DIDS;
   };
 
-  finalSettings = lib.filterAttrs (_: v: v != null)
-    (cfg.settings // derivedSettings // dbPathDefault // allowedDidsString);
+  finalSettings = lib.filterAttrs (_: v: v != null) (
+    cfg.settings // derivedSettings // dbPathDefault // allowedDidsString
+  );
   settingsFile = settingsFormat.generate "tealfm-piper.env" finalSettings;
 
-in {
-  meta = { maintainers = with lib.maintainers; [ ptdewey ]; };
+in
+{
+  meta = {
+    maintainers = with lib.maintainers; [ ptdewey ];
+  };
 
   options.services.tealfm-piper = {
     enable = mkEnableOption "Piper - teal.fm scrobbler service";
 
     package = mkOption {
       type = types.package;
-      default = if self != null then
-        self.packages.${pkgs.stdenv.hostPlatform.system}.tealfm-piper
-      else
-        pkgs.tealfm-piper;
+      default =
+        if self != null then
+          self.packages.${pkgs.stdenv.hostPlatform.system}.tealfm-piper
+        else
+          pkgs.tealfm-piper;
       defaultText = literalExpression "pkgs.tealfm-piper";
       description = "The piper package to use.";
     };
@@ -67,8 +85,13 @@ in {
 
     settings = mkOption {
       type = types.submodule {
-        freeformType = types.attrsOf
-          (types.oneOf [ (types.nullOr types.str) types.int types.port ]);
+        freeformType = types.attrsOf (
+          types.oneOf [
+            (types.nullOr types.str)
+            types.int
+            types.port
+          ]
+        );
 
         options = {
           SERVER_PORT = mkOption {
@@ -134,8 +157,7 @@ in {
           ALLOWED_DIDS = mkOption {
             type = types.nullOr (types.listOf types.str);
             default = null;
-            example =
-              literalExpression ''[ "did:plc:abcdefg" "did:web:example.com" ]'';
+            example = literalExpression ''[ "did:plc:abcdefg" "did:web:example.com" ]'';
             description = ''
               List of ATProto DIDs allowed to sign in.
               When set, restricts instance access to only these accounts.
@@ -205,7 +227,11 @@ in {
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;
-        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        RestrictAddressFamilies = [
+          "AF_INET"
+          "AF_INET6"
+          "AF_UNIX"
+        ];
         RestrictNamespaces = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
@@ -223,21 +249,16 @@ in {
 
     assertions = [
       {
-        assertion = (cfg.environmentFiles != [ ])
-          || (cfg.settings ? ATPROTO_CLIENT_SECRET_KEY);
-        message =
-          "services.tealfm-piper: ATPROTO_CLIENT_SECRET_KEY must be set via settings or environmentFiles";
+        assertion = (cfg.environmentFiles != [ ]) || (cfg.settings ? ATPROTO_CLIENT_SECRET_KEY);
+        message = "services.tealfm-piper: ATPROTO_CLIENT_SECRET_KEY must be set via settings or environmentFiles";
       }
       {
-        assertion = (cfg.environmentFiles != [ ])
-          || (cfg.settings ? ATPROTO_CLIENT_SECRET_KEY_ID);
-        message =
-          "services.tealfm-piper: ATPROTO_CLIENT_SECRET_KEY_ID must be set via settings or environmentFiles";
+        assertion = (cfg.environmentFiles != [ ]) || (cfg.settings ? ATPROTO_CLIENT_SECRET_KEY_ID);
+        message = "services.tealfm-piper: ATPROTO_CLIENT_SECRET_KEY_ID must be set via settings or environmentFiles";
       }
       {
         assertion = cfg.settings.SERVER_ROOT_URL != null;
-        message =
-          "services.tealfm-piper: SERVER_ROOT_URL must be set in settings (e.g., https://piper.teal.fm)";
+        message = "services.tealfm-piper: SERVER_ROOT_URL must be set in settings (e.g., https://piper.teal.fm)";
       }
     ];
   };

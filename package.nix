@@ -1,10 +1,15 @@
-{ lib, buildGoModule, tailwindcss_4, fetchFromGitHub, source ? fetchFromGitHub {
-  owner = "teal-fm";
-  repo = "piper";
-  # rev = "9920d5900c7cc317170bed1c54ea323879eba83c";
-  # hash = "sha256-k00Wkt7uhSZoxAz76IGEYpRDJLKhXT4eSGtdHvFp8jU=";
-
-} }:
+{
+  lib,
+  buildGoModule,
+  tailwindcss_4,
+  fetchFromGitHub,
+  source ? fetchFromGitHub {
+    owner = "teal-fm";
+    repo = "piper";
+    # rev = "9920d5900c7cc317170bed1c54ea323879eba83c";
+    # hash = "sha256-k00Wkt7uhSZoxAz76IGEYpRDJLKhXT4eSGtdHvFp8jU=";
+  },
+}:
 buildGoModule {
   pname = "tealfm-piper";
   version = "0.0.4";
@@ -19,7 +24,10 @@ buildGoModule {
 
   subPackages = [ "cmd" ];
 
-  ldflags = [ "-s" "-w" ];
+  ldflags = [
+    "-s"
+    "-w"
+  ];
 
   postBuild = ''
     cp -r ./pages/templates $out/

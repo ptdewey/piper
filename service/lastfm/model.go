@@ -1,6 +1,7 @@
 package lastfm
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"time"
@@ -12,42 +13,27 @@ type RecentTracksResponse struct {
 }
 
 type RecentTracks struct {
-	Tracks []Track      `json:"track"`
+	Tracks Tracks       `json:"track"`
 	Attr   TrackXMLAttr `json:"@attr"`
 }
 
-// Custom JSON unmarshaller for RecentTracks to handle the case where "track"
-// can be either an array or a single object.
-func (rt *RecentTracks) UnmarshalJSON(data []byte) error {
-	// Last.fm returns "track" as an array when there are multiple tracks,
-	// but as a single object when there is only one track.
-	type Alias RecentTracks
-	aux := &struct {
-		Tracks json.RawMessage `json:"track"`
-		*Alias
-	}{
-		Alias: (*Alias)(rt),
-	}
+// Tracks normalizes Last.fm's "track" field, which is returned as an array
+// when there are multiple tracks and as a single object when there is one.
+type Tracks []Track
 
-	if err := json.Unmarshal(data, aux); err != nil {
-		return err
-	}
-
-	if len(aux.Tracks) == 0 {
+func (t *Tracks) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
 		return nil
 	}
-
-	// Try array first
-	if aux.Tracks[0] == '[' {
-		return json.Unmarshal(aux.Tracks, &rt.Tracks)
+	if data[0] == '[' {
+		return json.Unmarshal(data, (*[]Track)(t))
 	}
-
-	// Single object
-	var single Track
-	if err := json.Unmarshal(aux.Tracks, &single); err != nil {
+	var one Track
+	if err := json.Unmarshal(data, &one); err != nil {
 		return err
 	}
-	rt.Tracks = []Track{single}
+	*t = []Track{one}
 	return nil
 }
 
