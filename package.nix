@@ -4,10 +4,10 @@
   tailwindcss_4,
   fetchFromGitHub,
   source ? fetchFromGitHub {
-    owner = "teal-fm";
+    owner = "ptdewey";
     repo = "piper";
-    # rev = "9920d5900c7cc317170bed1c54ea323879eba83c";
-    # hash = "sha256-k00Wkt7uhSZoxAz76IGEYpRDJLKhXT4eSGtdHvFp8jU=";
+    rev = "3ffedcb9c96f1cd4b2a98469c6475561e863a44a";
+    hash = "sha256-spivSgVycIEd3hq0L11ye2msiCxZb8JyHLZhPYlmPlg=";
   },
 }:
 buildGoModule {
