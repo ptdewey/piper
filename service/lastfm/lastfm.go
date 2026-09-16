@@ -254,51 +254,32 @@ func (l *Service) getRecentTracks(ctx context.Context, username string) (*Recent
 	return &recentTracksResp, nil
 }
 
-func (l *Service) StartListeningTracker(interval time.Duration) {
-	if err := l.loadUsernames(); err != nil {
-		l.logger.Printf("Failed to perform initial username load: %v", err)
-		// Decide if we should proceed without initial load or return error
+func (l *Service) StartListeningTracker(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
 	}
-
-	if len(l.Usernames) == 0 {
-		l.logger.Println("No Last.fm users configured. Tracker will run but fetch cycles will be skipped until users are added.")
-	} else {
-		l.logger.Printf("Found %d Last.fm users.", len(l.Usernames))
-	}
-
 	ticker := time.NewTicker(interval)
-	go func() {
-		// Initial fetch immediately
-		if len(l.Usernames) > 0 {
-			l.fetchAllUserTracks(context.Background())
-		} else {
-			l.logger.Println("Skipping initial fetch cycle as no users are configured.")
-		}
+	defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				// refresh usernames periodically from db
-				if err := l.loadUsernames(); err != nil {
-					l.logger.Printf("Error reloading usernames in ticker: %v", err)
-					// Continue ticker loop even if reload fails? Or log and potentially stop?
-					continue // Continue for now
-				}
-				if len(l.Usernames) > 0 {
-					l.fetchAllUserTracks(context.Background())
-				} else {
-					l.logger.Println("No Last.fm users configured. Skipping fetch cycle.")
-				}
-				// TODO: Implement graceful shutdown using context cancellation
-				// case <-ctx.Done():
-				//  l.logger.Println("Stopping Last.fm listening tracker.")
-				//	ticker.Stop()
-				//  return
-			}
-		}
-	}()
+	l.runPollCycle(ctx)
 
-	l.logger.Printf("Last.fm Listening Tracker started with interval %v", interval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.runPollCycle(ctx)
+		}
+	}
+
+}
+
+func (l *Service) runPollCycle(ctx context.Context) {
+	if err := l.loadUsernames(); err != nil {
+		l.logger.Printf("Error reloading usernames: %v", err)
+		return
+	}
+	l.fetchAllUserTracks(ctx)
 }
 
 // fetchAllUserTracks iterates through users and fetches their tracks.
@@ -476,13 +457,13 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 			HasStamped: true,
 		}
 
-		hydratedTrack, err := musicbrainz.HydrateTrack(l.musicBrainzService, baseTrack)
+		hydratedTrack, err := musicbrainz.HydrateTrack(ctx, l.musicBrainzService, baseTrack)
 		if err != nil {
 			l.logger.Printf("error hydrating track for user %s: %s - %s: %v", username, track.Artist.Text, track.Name, err)
 			// we can use the track without MBIDs, it's still valid
 			hydratedTrack = &baseTrack
 		}
-		_, err = l.db.SaveTrack(user.ID, db.SourceLastfm, hydratedTrack)
+		_, err = l.db.SaveTrackContext(ctx, user.ID, db.SourceLastfm, hydratedTrack)
 		if err != nil {
 			return err
 		}

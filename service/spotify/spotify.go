@@ -464,7 +464,7 @@ func generateLocalHash(track *models.Track) string {
 	return fmt.Sprintf("sp_local_%x", hash)
 }
 
-func (s *Service) FetchCurrentTrack(userID int64) (*SpotifyTrackResponse, error) {
+func (s *Service) FetchCurrentTrack(ctx context.Context, userID int64) (*SpotifyTrackResponse, error) {
 	s.mu.RLock()
 	token, exists := s.userTokens[userID]
 	s.mu.RUnlock()
@@ -473,7 +473,7 @@ func (s *Service) FetchCurrentTrack(userID int64) (*SpotifyTrackResponse, error)
 		return nil, fmt.Errorf("no access token for user %d", userID)
 	}
 
-	req, rErr := http.NewRequest("GET", "https://api.spotify.com/v1/me/player/currently-playing", nil)
+	req, rErr := http.NewRequestWithContext(ctx, "GET", "https://api.spotify.com/v1/me/player/currently-playing", nil)
 	if rErr != nil {
 		return nil, rErr
 	}
@@ -734,7 +734,7 @@ func (s *Service) computeStateUpdate(userID int64, resp *SpotifyTrackResponse) s
 // state update, and executes any required external actions.
 func (s *Service) fetchTrackForUser(ctx context.Context, userID int64) {
 	// Fetch from Spotify
-	resp, err := s.FetchCurrentTrack(userID)
+	resp, err := s.FetchCurrentTrack(ctx, userID)
 	if err != nil {
 		s.logger.Printf("Error fetching track for user %d: %v", userID, err)
 		return
@@ -802,7 +802,7 @@ func (s *Service) stampTrack(ctx context.Context, userID int64, track *models.Tr
 
 	trackToSubmit := track
 	if s.mb != nil {
-		hydratedTrack, err := musicbrainz.HydrateTrack(s.mb, *track)
+		hydratedTrack, err := musicbrainz.HydrateTrack(ctx, s.mb, *track)
 		if err != nil {
 			s.logger.Printf("User %d: Error hydrating track '%s' with MusicBrainz: %v", userID, track.Name, err)
 		} else {
@@ -812,57 +812,51 @@ func (s *Service) stampTrack(ctx context.Context, userID int64, track *models.Tr
 	}
 
 	// Save the track now that it is stamped and hydrated
-	if _, err := s.DB.SaveTrack(userID, db.SourceSpotify, trackToSubmit); err != nil {
+	_, err := s.DB.SaveTrackContext(ctx, userID, db.SourceSpotify, trackToSubmit)
+	if err != nil {
 		s.logger.Printf("Error saving track for user %d: %v", userID, err)
 		return
 	}
 
 	if err := atprotoservice.PublishStoredPlay(ctx, s.DB, userID, trackToSubmit.PlayID, s.atprotoAuthService); err != nil {
 		s.logger.Printf("User %d: Error submitting to PDS: %v", userID, err)
+		return
 	}
 }
 
-func (s *Service) StartListeningTracker(interval time.Duration) {
+func (s *Service) StartListeningTracker(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
 	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	go func() {
+	runOnce := func() {
 		if err := s.LoadAllUsers(); err != nil {
 			s.logger.Printf("Error loading spotify users: %v", err)
+			return
 		}
-
 		if len(s.userTokens) > 0 {
-			s.fetchAllUserTracks(context.Background())
+			s.fetchAllUserTracks(ctx)
 		} else {
 			s.logger.Printf("No users to fetch tracks for.")
 		}
 
 		//unloading users to save memory and make sure we get new signups
-		err := s.UnloadAllUsers()
-		if err != nil {
+		if err := s.UnloadAllUsers(); err != nil {
 			log.Printf("Error loading spotify users: %v", err)
 		}
+	}
 
-		for range ticker.C {
+	runOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			s.logger.Printf("Fetching tracks...")
-			err := s.LoadAllUsers()
-			if err != nil {
-				s.logger.Printf("Error loading spotify users: %v", err)
-				continue
-			}
-			if len(s.userTokens) > 0 {
-				s.fetchAllUserTracks(context.Background())
-			} else {
-				s.logger.Printf("No users to fetch tracks for.")
-				continue
-			}
-			//unloading users to save memory and make sure we get new signups
-			err = s.UnloadAllUsers()
-			if err != nil {
-				log.Printf("Error loading spotify users: %v", err)
-			}
-			s.logger.Printf("Finished fetch cycle suscessfully.")
-
+			runOnce()
+			s.logger.Printf("Finished fetch cycle successfully.")
 		}
-	}()
-
+	}
 }

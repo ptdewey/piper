@@ -383,7 +383,7 @@ func (s *Service) FetchRecentPlayedTracks(ctx context.Context, userToken string,
 }
 
 // toTrack converts AppleRecentTrack to internal models.Track
-func (s *Service) toTrack(t AppleRecentTrack) *models.Track {
+func (s *Service) toTrack(ctx context.Context, t AppleRecentTrack) *models.Track {
 	var duration int64
 	if t.Attributes.DurationInMillis != nil {
 		duration = *t.Attributes.DurationInMillis
@@ -417,7 +417,7 @@ func (s *Service) toTrack(t AppleRecentTrack) *models.Track {
 	}
 
 	if s.mbService != nil {
-		hydrated, err := musicbrainz.HydrateTrack(s.mbService, *track)
+		hydrated, err := musicbrainz.HydrateTrack(ctx, s.mbService, *track)
 		if err == nil && hydrated != nil {
 			track = hydrated
 		}
@@ -586,7 +586,7 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 	}
 
 	// Convert to internal track format
-	track := s.toTrack(*currentAppleTrack)
+	track := s.toTrack(ctx, *currentAppleTrack)
 	if track == nil || strings.TrimSpace(track.Name) == "" || len(track.Artist) == 0 {
 		s.logger.Printf("invalid track data for user %d", user.ID)
 		return nil
@@ -595,7 +595,8 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 	// Hydration is handled in toTrack() using MusicBrainz search; no ISRC-only hydration here
 
 	// Save the new track
-	if _, err := s.DB.SaveTrack(user.ID, db.SourceAppleMusic, track); err != nil {
+	_, err = s.DB.SaveTrackContext(ctx, user.ID, db.SourceAppleMusic, track)
+	if err != nil {
 		s.logger.Printf("failed saving apple track for user %d: %v", user.ID, err)
 		return err
 	}
@@ -613,6 +614,7 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 	if track.HasStamped {
 		if err := atprotoservice.PublishStoredPlay(ctx, s.DB, user.ID, track.PlayID, s.atprotoService); err != nil {
 			s.logger.Printf("failed submit to PDS for user %d: %v", user.ID, err)
+			return err
 		}
 	}
 
@@ -620,24 +622,31 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 }
 
 // StartListeningTracker periodically fetches recent plays for Apple Music linked users
-func (s *Service) StartListeningTracker(interval time.Duration) {
+func (s *Service) StartListeningTracker(ctx context.Context, interval time.Duration) {
 	if s.DB == nil {
 		if s.logger != nil {
 			s.logger.Printf("DB not configured; Apple Music tracker disabled")
 		}
 		return
 	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
 	ticker := time.NewTicker(interval)
-	go func() {
-		s.runOnce(context.Background())
-		for range ticker.C {
-			s.runOnce(context.Background())
+	defer ticker.Stop()
+	s.runOnce(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.runOnce(ctx)
 		}
-	}()
+	}
 }
 
 func (s *Service) runOnce(ctx context.Context) {
-	users, err := s.DB.GetAllAppleMusicLinkedUsers()
+	users, err := s.DB.GetAllAppleMusicLinkedUsersContext(ctx)
 	if err != nil {
 		s.logger.Printf("error loading Apple Music users: %v", err)
 		return

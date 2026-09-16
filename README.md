@@ -64,6 +64,20 @@ You now have to bring your own private key to run piper. Can do this via goat `g
 - `DB_PATH` - Path for the sqlite db. If you are using the docker compose probably want `/db/piper.db` to persist data
 - `ALLOWED_DIDS` - Restricts the ATProto accounts that can sign-in to the instance to a specific list of DIDs. Supply full DIDs as a space-separated list (e.g., `ALLOWED_DIDS=did:plc:abcdefg did:web:example.com`).
 
+#### observability
+
+Piper can export OpenTelemetry traces and metrics to an OTLP/gRPC collector. Telemetry is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is set. For example:
+
+```dotenv
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+OTEL_SERVICE_NAME=piper
+OTEL_TRACES_SAMPLER=parentbased_always_on
+```
+
+Standard OpenTelemetry exporter variables configure TLS, headers, timeouts, and sampling. Set `OTEL_SDK_DISABLED=true` to force telemetry off. Export is asynchronous and failures do not stop HTTP requests or listening trackers.
+
+The initial instrumentation covers the ListenBrainz poll-to-publication path, including account processing, MusicBrainz hydration, persistence, and ATProto publication. Telemetry attributes use bounded provider and outcome values; user IDs, account names, DIDs, track metadata, credentials, query strings, and raw errors are not exported.
+
 ##### listenbrainz
 
 Open the ListenBrainz card under "Your services" and paste the user token from your

@@ -47,7 +47,7 @@ func NewPlayingNowService(database *db.DB, atprotoService *atprotoauth.AuthServi
 // PublishPlayingNow publishes a currently playing track as actor status
 func (p *Service) PublishPlayingNow(ctx context.Context, userID int64, track *models.Track) error {
 	// Get user information to find their DID
-	user, err := p.db.GetUserByID(userID)
+	user, err := p.db.GetUserByIDContext(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}
@@ -73,7 +73,7 @@ func (p *Service) PublishPlayingNow(ctx context.Context, userID int64, track *mo
 	}
 
 	if p.mb != nil && track.RecordingMBID == nil {
-		hydratedTrack, err := musicbrainz.HydrateTrack(p.mb, *track)
+		hydratedTrack, err := musicbrainz.HydrateTrack(ctx, p.mb, *track)
 		if err != nil {
 			p.logger.Printf("User %d: Error hydrating track '%s' with MusicBrainz: %v", userID, track.Name, err)
 		} else {
@@ -148,7 +148,7 @@ func (p *Service) ClearPlayingNow(ctx context.Context, userID int64) error {
 	}
 
 	// Get user information
-	user, err := p.db.GetUserByID(userID)
+	user, err := p.db.GetUserByIDContext(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}

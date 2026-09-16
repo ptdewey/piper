@@ -398,8 +398,7 @@ func (s *Service) GetBestRelease(releases []Release, trackTitle string, expected
 	return &r
 }
 
-func HydrateTrack(mb *Service, track models.Track) (*models.Track, error) {
-	ctx := context.Background()
+func HydrateTrack(ctx context.Context, mb *Service, track models.Track) (*models.Track, error) {
 	// array of strings
 	artistArray := make([]string, len(track.Artist)) // Assuming Name is string type
 	for i, a := range track.Artist {
