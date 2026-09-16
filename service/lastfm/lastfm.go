@@ -3,6 +3,7 @@ package lastfm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 	atprotoauth "github.com/teal-fm/piper/oauth/atproto"
 	atprotoservice "github.com/teal-fm/piper/service/atproto"
@@ -163,7 +165,12 @@ func (l *Service) loadUsernames() error {
 }
 
 // getRecentTracks fetches the most recent tracks for a given Last.fm user.
-func (l *Service) getRecentTracks(ctx context.Context, username string) (*RecentTracksResponse, error) {
+func (l *Service) getRecentTracks(ctx context.Context, username string) (result *RecentTracksResponse, err error) {
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanProviderFetch, telemetry.ProviderLastFM, telemetry.OperationProviderFetch)
+	defer func() {
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+	}()
 	if username == "" {
 		return nil, fmt.Errorf("username cannot be empty")
 	}
@@ -254,55 +261,47 @@ func (l *Service) getRecentTracks(ctx context.Context, username string) (*Recent
 	return &recentTracksResp, nil
 }
 
-func (l *Service) StartListeningTracker(interval time.Duration) {
-	if err := l.loadUsernames(); err != nil {
-		l.logger.Printf("Failed to perform initial username load: %v", err)
-		// Decide if we should proceed without initial load or return error
+func (l *Service) StartListeningTracker(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
 	}
-
-	if len(l.Usernames) == 0 {
-		l.logger.Println("No Last.fm users configured. Tracker will run but fetch cycles will be skipped until users are added.")
-	} else {
-		l.logger.Printf("Found %d Last.fm users.", len(l.Usernames))
-	}
-
 	ticker := time.NewTicker(interval)
-	go func() {
-		// Initial fetch immediately
-		if len(l.Usernames) > 0 {
-			l.fetchAllUserTracks(context.Background())
-		} else {
-			l.logger.Println("Skipping initial fetch cycle as no users are configured.")
-		}
+	defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				// refresh usernames periodically from db
-				if err := l.loadUsernames(); err != nil {
-					l.logger.Printf("Error reloading usernames in ticker: %v", err)
-					// Continue ticker loop even if reload fails? Or log and potentially stop?
-					continue // Continue for now
-				}
-				if len(l.Usernames) > 0 {
-					l.fetchAllUserTracks(context.Background())
-				} else {
-					l.logger.Println("No Last.fm users configured. Skipping fetch cycle.")
-				}
-				// TODO: Implement graceful shutdown using context cancellation
-				// case <-ctx.Done():
-				//  l.logger.Println("Stopping Last.fm listening tracker.")
-				//	ticker.Stop()
-				//  return
-			}
-		}
-	}()
+	l.runPollCycle(ctx)
 
-	l.logger.Printf("Last.fm Listening Tracker started with interval %v", interval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.runPollCycle(ctx)
+		}
+	}
+
+}
+
+func (l *Service) runPollCycle(ctx context.Context) {
+	ctx = telemetry.WithProvider(ctx, telemetry.ProviderLastFM)
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanPollCycle, telemetry.ProviderLastFM, telemetry.OperationPollCycle)
+	started := time.Now()
+	err := l.loadUsernames()
+	userCount := len(l.Usernames)
+	if err == nil {
+		err = l.fetchAllUserTracks(ctx)
+	}
+	outcome, errorType := telemetry.ClassifyError(err)
+	if err == nil && userCount == 0 {
+		outcome = telemetry.OutcomeEmpty
+	}
+	telemetry.EndSpan(span, outcome, errorType)
+	if instruments := telemetry.DefaultInstruments(); instruments != nil {
+		instruments.RecordPollCycle(ctx, telemetry.ProviderLastFM, outcome, time.Since(started))
+	}
 }
 
 // fetchAllUserTracks iterates through users and fetches their tracks.
-func (l *Service) fetchAllUserTracks(ctx context.Context) {
+func (l *Service) fetchAllUserTracks(ctx context.Context) error {
 	l.logger.Printf("Starting fetch cycle for %d users...", len(l.Usernames))
 	var wg sync.WaitGroup                             // Use WaitGroup to fetch concurrently (optional)
 	fetchErrors := make(chan error, len(l.Usernames)) // Channel for errors
@@ -316,15 +315,26 @@ func (l *Service) fetchAllUserTracks(ctx context.Context) {
 		wg.Add(1)
 		go func(uname string) { // Launch fetch and process in a goroutine per user
 			defer wg.Done()
+			accountCtx, span := telemetry.StartSpan(ctx, telemetry.SpanPollAccount, telemetry.ProviderLastFM, telemetry.OperationPollAccount)
+			var accountErr error
+			defer func() {
+				outcome, errorType := telemetry.ClassifyError(accountErr)
+				telemetry.EndSpan(span, outcome, errorType)
+				if instruments := telemetry.DefaultInstruments(); instruments != nil {
+					instruments.RecordPollAccount(accountCtx, telemetry.ProviderLastFM, outcome)
+				}
+			}()
 			if ctx.Err() != nil {
+				accountErr = ctx.Err()
 				l.logger.Printf("Context cancelled during fetch cycle for user %s.", uname)
 				return // Exit goroutine if context is cancelled
 			}
 
 			// Fetch slightly more than 1 track to better handle edge cases
 			// where the latest is 'now playing' or duplicates exist.
-			recentTracks, err := l.getRecentTracks(ctx, uname)
+			recentTracks, err := l.getRecentTracks(accountCtx, uname)
 			if err != nil {
+				accountErr = err
 				l.logger.Printf("Error fetching tracks for %s: %v", uname, err)
 				fetchErrors <- fmt.Errorf("fetch failed for %s: %w", uname, err) // Report error
 				return
@@ -336,7 +346,8 @@ func (l *Service) fetchAllUserTracks(ctx context.Context) {
 			}
 
 			// Process the fetched tracks
-			if err := l.processTracks(ctx, uname, recentTracks.RecentTracks.Tracks); err != nil {
+			if err := l.processTracks(accountCtx, uname, recentTracks.RecentTracks.Tracks); err != nil {
+				accountErr = err
 				l.logger.Printf("Error processing tracks for %s: %v", uname, err)
 				fetchErrors <- fmt.Errorf("process failed for %s: %w", uname, err) // Report error
 			}
@@ -348,9 +359,11 @@ func (l *Service) fetchAllUserTracks(ctx context.Context) {
 
 	// Log any errors that occurred during the fetch cycle
 	errorCount := 0
+	var cycleErrors []error
 	for err := range fetchErrors {
 		l.logger.Printf("Fetch cycle error: %v", err)
 		errorCount++
+		cycleErrors = append(cycleErrors, err)
 	}
 
 	if errorCount > 0 {
@@ -358,6 +371,7 @@ func (l *Service) fetchAllUserTracks(ctx context.Context) {
 	} else {
 		l.logger.Println("Finished fetch cycle successfully.")
 	}
+	return errors.Join(cycleErrors...)
 }
 
 func (l *Service) processTracks(ctx context.Context, username string, tracks []Track) error {
@@ -384,6 +398,7 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 	var (
 		processedCount      int
 		latestProcessedTime time.Time
+		publicationErrors   []error
 	)
 
 	// handle now playing track separately
@@ -407,6 +422,7 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 				piperTrack := l.convertLastFMTrackToModelsTrack(nowPlayingTrack)
 				if err := l.playingNowService.PublishPlayingNow(ctx, user.ID, piperTrack); err != nil {
 					l.logger.Printf("Error publishing playing now for user %s: %v", username, err)
+					publicationErrors = append(publicationErrors, err)
 				}
 			}
 		}
@@ -416,6 +432,7 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 		if l.playingNowService != nil {
 			if err := l.playingNowService.ClearPlayingNow(ctx, user.ID); err != nil {
 				l.logger.Printf("Error clearing playing now for user %s: %v", username, err)
+				publicationErrors = append(publicationErrors, err)
 			}
 		}
 	}
@@ -431,7 +448,7 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 
 	if lastNonNowPlaying == nil {
 		l.logger.Printf("no non-now-playing tracks found for user %s.", username)
-		return nil
+		return errors.Join(publicationErrors...)
 	}
 
 	latestTrackTime := lastNonNowPlaying.Date
@@ -442,7 +459,7 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 
 	if lastKnownTimestamp != nil && lastKnownTimestamp.Equal(latestTrackTime.Time) {
 		l.logger.Printf("no new tracks to process for user %s.", username)
-		return nil
+		return errors.Join(publicationErrors...)
 	}
 
 	for _, track := range tracks {
@@ -476,13 +493,19 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 			HasStamped: true,
 		}
 
-		hydratedTrack, err := musicbrainz.HydrateTrack(l.musicBrainzService, baseTrack)
+		hydrateCtx, span := telemetry.StartSpan(ctx, telemetry.SpanMusicBrainzHydrate, telemetry.ProviderLastFM, telemetry.OperationHydrate)
+		hydratedTrack, err := musicbrainz.HydrateTrack(hydrateCtx, l.musicBrainzService, baseTrack)
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
 		if err != nil {
 			l.logger.Printf("error hydrating track for user %s: %s - %s: %v", username, track.Artist.Text, track.Name, err)
 			// we can use the track without MBIDs, it's still valid
 			hydratedTrack = &baseTrack
 		}
-		_, err = l.db.SaveTrack(user.ID, db.SourceLastfm, hydratedTrack)
+		persistCtx, span := telemetry.StartSpan(ctx, telemetry.SpanDBPersistPlay, telemetry.ProviderLastFM, telemetry.OperationPersistPlay)
+		_, err = l.db.SaveTrackContext(persistCtx, user.ID, db.SourceLastfm, hydratedTrack)
+		outcome, errorType = telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
 		if err != nil {
 			return err
 		}
@@ -490,6 +513,7 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 		err = atprotoservice.PublishStoredPlay(ctx, l.db, user.ID, hydratedTrack.PlayID, l.atprotoService)
 		if err != nil {
 			l.logger.Printf("error submitting track for user %s: %s - %s: %v", username, track.Artist.Text, track.Name, err)
+			publicationErrors = append(publicationErrors, err)
 		}
 		processedCount++
 
@@ -507,7 +531,7 @@ func (l *Service) processTracks(ctx context.Context, username string, tracks []T
 			processedCount, username, latestProcessedTime.Format(time.RFC3339))
 	}
 
-	return nil
+	return errors.Join(publicationErrors...)
 }
 
 // convertLastFMTrackToModelsTrack converts a Last.fm Track to models.Track format

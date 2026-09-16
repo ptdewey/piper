@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/viper"
@@ -15,6 +20,7 @@ import (
 
 	"github.com/teal-fm/piper/config"
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 	"github.com/teal-fm/piper/oauth"
 	"github.com/teal-fm/piper/oauth/atproto"
@@ -61,14 +67,34 @@ func jsonResponse(w http.ResponseWriter, statusCode int, data any) {
 
 func main() {
 	config.Load()
+	skipDatabaseClose := false
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	telemetrySDK, err := telemetry.NewSDK(ctx, models.SubmissionAgent)
+	if err != nil {
+		log.Printf("OpenTelemetry initialization failed; continuing without export: %v", err)
+	}
+	defer func() {
+		if telemetrySDK != nil {
+			_ = telemetrySDK.Shutdown(context.Background())
+		}
+	}()
 
 	database, err := db.New(viper.GetString("db.path"))
 	if err != nil {
-		log.Fatalf("Error connecting to database: %v", err)
+		log.Printf("Error connecting to database: %v", err)
+		return
 	}
+	defer func() {
+		if !skipDatabaseClose {
+			_ = database.Close()
+		}
+	}()
 
 	if err := database.Initialize(); err != nil {
-		log.Fatalf("Error initializing database: %v", err)
+		log.Printf("Error initializing database: %v", err)
+		return
 	}
 
 	sessionManager := session.NewSessionManager(database)
@@ -101,7 +127,8 @@ func main() {
 		allowedDids,
 	)
 	if err != nil {
-		log.Fatalf("Error creating ATproto auth service: %v", err)
+		log.Printf("Error creating ATproto auth service: %v", err)
+		return
 	}
 
 	mbService := musicbrainz.NewMusicBrainzService(database)
@@ -151,7 +178,8 @@ func main() {
 
 	if enableListenBrainz {
 		if err := listenbrainz.ValidateAPIURL(viper.GetString("listenbrainz.api_url")); err != nil {
-			log.Fatal(err)
+			log.Printf("Invalid ListenBrainz API URL: %v", err)
+			return
 		}
 		contactURL := viper.GetString("server.root_url")
 		if contactURL == "" {
@@ -254,9 +282,18 @@ func main() {
 
 	trackerInterval := time.Duration(viper.GetInt("tracker.interval")) * time.Second
 
+	var pollers sync.WaitGroup
+	startPoller := func(run func()) {
+		pollers.Add(1)
+		go func() {
+			defer pollers.Done()
+			run()
+		}()
+	}
+
 	// Start Spotify listening tracker if service is configured
 	if spotifyService != nil {
-		go spotifyService.StartListeningTracker(trackerInterval)
+		startPoller(func() { spotifyService.StartListeningTracker(ctx, trackerInterval) })
 		log.Println("Spotify listening tracker started")
 	}
 
@@ -266,30 +303,76 @@ func main() {
 		if lastfmInterval <= 0 {
 			lastfmInterval = 30 * time.Second
 		}
-		go lastfmService.StartListeningTracker(lastfmInterval)
+		startPoller(func() { lastfmService.StartListeningTracker(ctx, lastfmInterval) })
 		log.Println("Last.fm listening tracker started")
 	}
 
 	if listenBrainzService != nil {
 		listenBrainzInterval := time.Duration(viper.GetInt("listenbrainz.interval_seconds")) * time.Second
-		go listenBrainzService.StartListeningTracker(listenBrainzInterval)
+		startPoller(func() { listenBrainzService.StartListeningTracker(ctx, listenBrainzInterval) })
 		log.Println("ListenBrainz listening tracker started")
 	}
 
 	// Start Apple Music tracker if service is configured
 	if appleMusicService != nil {
-		go appleMusicService.StartListeningTracker(trackerInterval)
+		startPoller(func() { appleMusicService.StartListeningTracker(ctx, trackerInterval) })
 		log.Println("Apple Music listening tracker started")
 	}
 
 	serverAddr := fmt.Sprintf("%s:%s", viper.GetString("server.host"), viper.GetString("server.port"))
 	server := &http.Server{
 		Addr:         serverAddr,
-		Handler:      app.routes(),
+		Handler:      telemetry.HTTPHandler(app.routes()),
 		IdleTimeout:  time.Minute,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 	fmt.Printf("Server running at: http://%s\n", serverAddr)
-	log.Fatal(server.ListenAndServe())
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case <-ctx.Done():
+	case err := <-serverErr:
+		if err != nil {
+			log.Printf("HTTP server failed: %v", err)
+		}
+		cancel()
+	}
+
+	httpShutdownCtx, httpShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := server.Shutdown(httpShutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown failed: %v", err)
+	}
+	httpShutdownCancel()
+
+	pollersDone := make(chan struct{})
+	go func() {
+		pollers.Wait()
+		close(pollersDone)
+	}()
+	pollerShutdownCtx, pollerShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	select {
+	case <-pollersDone:
+	case <-pollerShutdownCtx.Done():
+		log.Printf("Timed out waiting for listening trackers to stop")
+		pollerShutdownCancel()
+		skipDatabaseClose = true
+		return
+	}
+	pollerShutdownCancel()
+
+	if telemetrySDK != nil {
+		if err := telemetrySDK.Shutdown(context.Background()); err != nil {
+			log.Printf("OpenTelemetry shutdown failed: %v", err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		log.Printf("Database shutdown failed: %v", err)
+	}
 }

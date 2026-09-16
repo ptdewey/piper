@@ -18,6 +18,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 )
 
@@ -242,7 +243,14 @@ func (s *Service) RecordingMetadata(ctx context.Context, id string) (*Recording,
 	return &recording, nil
 }
 
-func (s *Service) SearchMusicBrainz(ctx context.Context, params SearchParams) ([]Recording, error) {
+func (s *Service) SearchMusicBrainz(ctx context.Context, params SearchParams) (recordings []Recording, err error) {
+	cacheOutcome := telemetry.CacheMiss
+	defer func() {
+		outcome, _ := telemetry.ClassifyError(err)
+		if instruments := telemetry.DefaultInstruments(); instruments != nil {
+			instruments.RecordMusicBrainzLookup(ctx, outcome, cacheOutcome)
+		}
+	}()
 	if params.Track == "" && params.Artist == "" && params.Release == "" && params.ISRC == "" {
 		return nil, fmt.Errorf("at least one search parameter (Track, Artist, Release, ISRC) must be provided")
 	}
@@ -253,6 +261,7 @@ func (s *Service) SearchMusicBrainz(ctx context.Context, params SearchParams) ([
 	cacheKey := generateCacheKey(params)
 
 	if recordings, found := s.getCacheEntry(cacheKey); found {
+		cacheOutcome = telemetry.CacheHit
 		s.logger.Printf("Cache hit for MusicBrainz search: key=%s", cacheKey)
 		return recordings, nil
 	}
@@ -398,8 +407,7 @@ func (s *Service) GetBestRelease(releases []Release, trackTitle string, expected
 	return &r
 }
 
-func HydrateTrack(mb *Service, track models.Track) (*models.Track, error) {
-	ctx := context.Background()
+func HydrateTrack(ctx context.Context, mb *Service, track models.Track) (*models.Track, error) {
 	// array of strings
 	artistArray := make([]string, len(track.Artist)) // Assuming Name is string type
 	for i, a := range track.Artist {

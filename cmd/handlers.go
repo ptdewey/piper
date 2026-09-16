@@ -874,7 +874,7 @@ func hydrateAndSubmitListens(database *db.DB, atprotoService *atprotoauth.AuthSe
 		track := saved.track
 
 		if mbService != nil && track.RecordingMBID == nil {
-			hydratedTrack, err := musicbrainz.HydrateTrack(mbService, track)
+			hydratedTrack, err := musicbrainz.HydrateTrack(ctx, mbService, track)
 			if err != nil {
 				log.Printf("apiSubmitListensHandler: Could not hydrate track with MusicBrainz for user %d: %v (continuing with original data)", userID, err)
 			} else if hydratedTrack != nil {

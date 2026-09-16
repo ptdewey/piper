@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 	atprotoauth "github.com/teal-fm/piper/oauth/atproto"
 	atprotoservice "github.com/teal-fm/piper/service/atproto"
@@ -43,9 +44,10 @@ type Service struct {
 	apiURL             string
 	userAgent          string
 	musicBrainzService *musicbrainz.Service
-	hydrateTrack       func(models.Track) (*models.Track, error)
+	hydrateTrack       func(context.Context, models.Track) (*models.Track, error)
 	atprotoService     *atprotoauth.AuthService
 	playingNowService  playingNowPublisher
+	instruments        *telemetry.Instruments
 
 	mu                 sync.Mutex
 	lastSeenNowPlaying map[int64]string
@@ -97,9 +99,14 @@ func NewService(database *db.DB, apiURL, userAgent string, musicBrainzService *m
 		logger:             log.New(os.Stdout, "listenbrainz: ", log.LstdFlags|log.Lmsgprefix),
 	}
 	if musicBrainzService != nil {
-		service.hydrateTrack = func(track models.Track) (*models.Track, error) {
-			return musicbrainz.HydrateTrack(musicBrainzService, track)
+		service.hydrateTrack = func(ctx context.Context, track models.Track) (*models.Track, error) {
+			return musicbrainz.HydrateTrack(ctx, musicBrainzService, track)
 		}
+	}
+	if instruments, err := telemetry.NewInstruments(); err != nil {
+		service.logger.Printf("Could not initialize telemetry instruments: %v", err)
+	} else {
+		service.instruments = instruments
 	}
 	return service
 }
@@ -122,32 +129,65 @@ func (s *Service) ValidateToken(ctx context.Context, token string) (string, erro
 }
 
 // StartListeningTracker polls all linked accounts until the process exits.
-func (s *Service) StartListeningTracker(interval time.Duration) {
+func (s *Service) StartListeningTracker(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
 
 	s.logger.Printf("ListenBrainz listening tracker started with interval %v", interval)
-	s.syncAllUsers(context.Background())
+	s.runPollCycle(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.syncAllUsers(context.Background())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.runPollCycle(ctx)
+		}
 	}
 }
 
-func (s *Service) syncAllUsers(ctx context.Context) {
-	users, err := s.db.GetAllUsersWithListenBrainz()
+func (s *Service) runPollCycle(ctx context.Context) {
+	ctx = telemetry.WithProvider(ctx, telemetry.ProviderListenBrainz)
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanPollCycle, telemetry.ProviderListenBrainz, telemetry.OperationPollCycle)
+	started := time.Now()
+	count, err := s.syncAllUsers(ctx)
+	outcome, errorType := telemetry.ClassifyError(err)
+	if err == nil && count == 0 {
+		outcome = telemetry.OutcomeEmpty
+	}
+	telemetry.EndSpan(span, outcome, errorType)
+	if s.instruments != nil {
+		s.instruments.RecordPollCycle(ctx, telemetry.ProviderListenBrainz, outcome, time.Since(started))
+	}
+}
+
+func (s *Service) syncAllUsers(ctx context.Context) (int, error) {
+	users, err := s.db.GetAllUsersWithListenBrainzContext(ctx)
 	if err != nil {
 		s.logger.Printf("Could not load linked users: %v", err)
-		return
+		return 0, err
 	}
 
 	linked := make(map[int64]struct{}, len(users))
+	var syncErrors []error
 	for _, user := range users {
+		if err := ctx.Err(); err != nil {
+			syncErrors = append(syncErrors, err)
+			break
+		}
 		linked[user.ID] = struct{}{}
-		if err := s.SyncUser(ctx, user); err != nil {
+		accountCtx, span := telemetry.StartSpan(ctx, telemetry.SpanPollAccount, telemetry.ProviderListenBrainz, telemetry.OperationPollAccount)
+		err := s.SyncUser(accountCtx, user)
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+		if s.instruments != nil {
+			s.instruments.RecordPollAccount(accountCtx, telemetry.ProviderListenBrainz, outcome)
+		}
+		if err != nil {
 			s.logger.Printf("Could not sync user %d: %v", user.ID, err)
+			syncErrors = append(syncErrors, err)
 		}
 	}
 
@@ -158,6 +198,7 @@ func (s *Service) syncAllUsers(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
+	return len(users), errors.Join(syncErrors...)
 }
 
 // SyncUser fetches the account's current listen and all new completed listens.
@@ -287,6 +328,7 @@ func (s *Service) syncListens(ctx context.Context, user *models.User) error {
 	})
 
 	var newest time.Time
+	var publicationErrors []error
 	for i := range listens {
 		listen := &listens[i]
 		if listen.ListenedAt == nil || listen.TrackMetadata.TrackName == "" || listen.TrackMetadata.ArtistName == "" {
@@ -303,7 +345,10 @@ func (s *Service) syncListens(ctx context.Context, user *models.User) error {
 		}
 
 		if track.RecordingMBID == nil && s.hydrateTrack != nil {
-			hydrated, err := s.hydrateTrack(track)
+			hydrateCtx, span := telemetry.StartSpan(ctx, telemetry.SpanMusicBrainzHydrate, telemetry.ProviderListenBrainz, telemetry.OperationHydrate)
+			hydrated, err := s.hydrateTrack(hydrateCtx, track)
+			outcome, errorType := telemetry.ClassifyError(err)
+			telemetry.EndSpan(span, outcome, errorType)
 			if err != nil {
 				s.logger.Printf("Could not hydrate %s by %s: %v", track.Name, track.Artist[0].Name, err)
 			} else if hydrated != nil {
@@ -312,30 +357,34 @@ func (s *Service) syncListens(ctx context.Context, user *models.User) error {
 		}
 
 		s.enrichTrack(ctx, &track)
-		exists, err := s.db.HasListenBrainzTrack(user.ID, sourceIdentity)
+		exists, err := s.db.HasListenBrainzTrackContext(ctx, user.ID, sourceIdentity)
 		if err != nil {
 			return err
 		}
 		if exists {
 			continue
 		}
-		trackID, err := s.db.SaveListenBrainzTrack(user.ID, sourceIdentity, &track)
+		persistCtx, span := telemetry.StartSpan(ctx, telemetry.SpanDBPersistPlay, telemetry.ProviderListenBrainz, telemetry.OperationPersistPlay)
+		trackID, err := s.db.SaveListenBrainzTrackContext(persistCtx, user.ID, sourceIdentity, &track)
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
 		if err != nil {
 			return fmt.Errorf("saving %s by %s: %w", track.Name, track.Artist[0].Name, err)
 		}
 		if user.ATProtoDID != nil && user.MostRecentAtProtoSessionID != nil && s.atprotoService != nil {
 			if err := atprotoservice.PublishStoredPlay(ctx, s.db, user.ID, trackID, s.atprotoService); err != nil {
 				s.logger.Printf("Could not submit %s by %s for user %d: %v", track.Name, track.Artist[0].Name, user.ID, err)
+				publicationErrors = append(publicationErrors, err)
 			}
 		}
 	}
 	if !newest.IsZero() {
-		if err := s.db.SaveListenBrainzSyncTimestamp(user.ID, newest); err != nil {
+		if err := s.db.SaveListenBrainzSyncTimestampContext(ctx, user.ID, newest); err != nil {
 			return err
 		}
 		advanceUserCursor(user, newest)
 	}
-	return nil
+	return errors.Join(publicationErrors...)
 }
 
 func listenSourceIdentity(listen *models.ListenBrainzPayload) string {
@@ -398,7 +447,12 @@ func (s *Service) enrichTrack(ctx context.Context, track *models.Track) {
 	}
 }
 
-func (s *Service) getJSON(ctx context.Context, path, token string, query url.Values, target any) error {
+func (s *Service) getJSON(ctx context.Context, path, token string, query url.Values, target any) (err error) {
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanProviderFetch, telemetry.ProviderListenBrainz, telemetry.OperationProviderFetch)
+	defer func() {
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+	}()
 	if err := ValidateAPIURL(s.apiURL); err != nil {
 		return err
 	}

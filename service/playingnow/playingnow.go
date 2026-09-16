@@ -16,6 +16,7 @@ import (
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/teal-fm/piper/api/teal"
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 	atprotoauth "github.com/teal-fm/piper/oauth/atproto"
 	"github.com/teal-fm/piper/service/musicbrainz"
@@ -45,9 +46,14 @@ func NewPlayingNowService(database *db.DB, atprotoService *atprotoauth.AuthServi
 }
 
 // PublishPlayingNow publishes a currently playing track as actor status
-func (p *Service) PublishPlayingNow(ctx context.Context, userID int64, track *models.Track) error {
+func (p *Service) PublishPlayingNow(ctx context.Context, userID int64, track *models.Track) (err error) {
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanATProtoPlayingNow, "", telemetry.OperationPublishPlaying)
+	defer func() {
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+	}()
 	// Get user information to find their DID
-	user, err := p.db.GetUserByID(userID)
+	user, err := p.db.GetUserByIDContext(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}
@@ -73,7 +79,7 @@ func (p *Service) PublishPlayingNow(ctx context.Context, userID int64, track *mo
 	}
 
 	if p.mb != nil && track.RecordingMBID == nil {
-		hydratedTrack, err := musicbrainz.HydrateTrack(p.mb, *track)
+		hydratedTrack, err := musicbrainz.HydrateTrack(ctx, p.mb, *track)
 		if err != nil {
 			p.logger.Printf("User %d: Error hydrating track '%s' with MusicBrainz: %v", userID, track.Name, err)
 		} else {
@@ -137,7 +143,12 @@ func (p *Service) PublishPlayingNow(ctx context.Context, userID int64, track *mo
 }
 
 // ClearPlayingNow removes the current playing status by setting an expired status
-func (p *Service) ClearPlayingNow(ctx context.Context, userID int64) error {
+func (p *Service) ClearPlayingNow(ctx context.Context, userID int64) (err error) {
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanATProtoPlayingNow, "", telemetry.OperationPublishPlaying)
+	defer func() {
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+	}()
 	// Check if status is already cleared to avoid clearing on the users repo over and over
 	p.mu.RLock()
 	alreadyCleared := p.clearedStatus[userID]
@@ -148,7 +159,7 @@ func (p *Service) ClearPlayingNow(ctx context.Context, userID int64) error {
 	}
 
 	// Get user information
-	user, err := p.db.GetUserByID(userID)
+	user, err := p.db.GetUserByIDContext(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}

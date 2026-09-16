@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"log"
@@ -28,7 +29,7 @@ func main() {
 		Artist: []models.Artist{{Name: *artist}},
 	}
 
-	enriched, err := musicbrainz.HydrateTrack(mbService, trackModel)
+	enriched, err := musicbrainz.HydrateTrack(context.Background(), mbService, trackModel)
 	if err != nil {
 		log.Fatalf("Error enriching track: %v", err)
 	}

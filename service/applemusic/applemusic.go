@@ -22,6 +22,7 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jws"
 	"github.com/lestrrat-go/jwx/v3/jwt"
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 	atprotoauth "github.com/teal-fm/piper/oauth/atproto"
 	atprotoservice "github.com/teal-fm/piper/service/atproto"
@@ -383,7 +384,7 @@ func (s *Service) FetchRecentPlayedTracks(ctx context.Context, userToken string,
 }
 
 // toTrack converts AppleRecentTrack to internal models.Track
-func (s *Service) toTrack(t AppleRecentTrack) *models.Track {
+func (s *Service) toTrack(ctx context.Context, t AppleRecentTrack) *models.Track {
 	var duration int64
 	if t.Attributes.DurationInMillis != nil {
 		duration = *t.Attributes.DurationInMillis
@@ -417,7 +418,10 @@ func (s *Service) toTrack(t AppleRecentTrack) *models.Track {
 	}
 
 	if s.mbService != nil {
-		hydrated, err := musicbrainz.HydrateTrack(s.mbService, *track)
+		hydrateCtx, span := telemetry.StartSpan(ctx, telemetry.SpanMusicBrainzHydrate, telemetry.ProviderAppleMusic, telemetry.OperationHydrate)
+		hydrated, err := musicbrainz.HydrateTrack(hydrateCtx, s.mbService, *track)
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
 		if err == nil && hydrated != nil {
 			track = hydrated
 		}
@@ -550,7 +554,10 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 	}
 
 	// Fetch only the most recent track
-	currentAppleTrack, err := s.GetCurrentAppleMusicTrack(ctx, user)
+	fetchCtx, span := telemetry.StartSpan(ctx, telemetry.SpanProviderFetch, telemetry.ProviderAppleMusic, telemetry.OperationProviderFetch)
+	currentAppleTrack, err := s.GetCurrentAppleMusicTrack(fetchCtx, user)
+	outcome, errorType := telemetry.ClassifyError(err)
+	telemetry.EndSpan(span, outcome, errorType)
 	if err != nil {
 		s.logger.Printf("failed to get current Apple Music track for user %d: %v", user.ID, err)
 		return err
@@ -586,7 +593,7 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 	}
 
 	// Convert to internal track format
-	track := s.toTrack(*currentAppleTrack)
+	track := s.toTrack(ctx, *currentAppleTrack)
 	if track == nil || strings.TrimSpace(track.Name) == "" || len(track.Artist) == 0 {
 		s.logger.Printf("invalid track data for user %d", user.ID)
 		return nil
@@ -595,7 +602,11 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 	// Hydration is handled in toTrack() using MusicBrainz search; no ISRC-only hydration here
 
 	// Save the new track
-	if _, err := s.DB.SaveTrack(user.ID, db.SourceAppleMusic, track); err != nil {
+	persistCtx, span := telemetry.StartSpan(ctx, telemetry.SpanDBPersistPlay, telemetry.ProviderAppleMusic, telemetry.OperationPersistPlay)
+	_, err = s.DB.SaveTrackContext(persistCtx, user.ID, db.SourceAppleMusic, track)
+	outcome, errorType = telemetry.ClassifyError(err)
+	telemetry.EndSpan(span, outcome, errorType)
+	if err != nil {
 		s.logger.Printf("failed saving apple track for user %d: %v", user.ID, err)
 		return err
 	}
@@ -613,6 +624,7 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 	if track.HasStamped {
 		if err := atprotoservice.PublishStoredPlay(ctx, s.DB, user.ID, track.PlayID, s.atprotoService); err != nil {
 			s.logger.Printf("failed submit to PDS for user %d: %v", user.ID, err)
+			return err
 		}
 	}
 
@@ -620,34 +632,66 @@ func (s *Service) ProcessUser(ctx context.Context, user *models.User) error {
 }
 
 // StartListeningTracker periodically fetches recent plays for Apple Music linked users
-func (s *Service) StartListeningTracker(interval time.Duration) {
+func (s *Service) StartListeningTracker(ctx context.Context, interval time.Duration) {
 	if s.DB == nil {
 		if s.logger != nil {
 			s.logger.Printf("DB not configured; Apple Music tracker disabled")
 		}
 		return
 	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
 	ticker := time.NewTicker(interval)
-	go func() {
-		s.runOnce(context.Background())
-		for range ticker.C {
-			s.runOnce(context.Background())
+	defer ticker.Stop()
+	s.runPollCycle(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.runPollCycle(ctx)
 		}
-	}()
+	}
 }
 
-func (s *Service) runOnce(ctx context.Context) {
-	users, err := s.DB.GetAllAppleMusicLinkedUsers()
+func (s *Service) runPollCycle(ctx context.Context) {
+	ctx = telemetry.WithProvider(ctx, telemetry.ProviderAppleMusic)
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanPollCycle, telemetry.ProviderAppleMusic, telemetry.OperationPollCycle)
+	started := time.Now()
+	count, err := s.runOnce(ctx)
+	outcome, errorType := telemetry.ClassifyError(err)
+	if err == nil && count == 0 {
+		outcome = telemetry.OutcomeEmpty
+	}
+	telemetry.EndSpan(span, outcome, errorType)
+	if instruments := telemetry.DefaultInstruments(); instruments != nil {
+		instruments.RecordPollCycle(ctx, telemetry.ProviderAppleMusic, outcome, time.Since(started))
+	}
+}
+
+func (s *Service) runOnce(ctx context.Context) (int, error) {
+	users, err := s.DB.GetAllAppleMusicLinkedUsersContext(ctx)
 	if err != nil {
 		s.logger.Printf("error loading Apple Music users: %v", err)
-		return
+		return 0, err
 	}
+	var processErrors []error
 	for _, u := range users {
 		if ctx.Err() != nil {
-			return
+			return len(users), ctx.Err()
 		}
-		if err := s.ProcessUser(ctx, u); err != nil {
+		accountCtx, span := telemetry.StartSpan(ctx, telemetry.SpanPollAccount, telemetry.ProviderAppleMusic, telemetry.OperationPollAccount)
+		err := s.ProcessUser(accountCtx, u)
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+		if instruments := telemetry.DefaultInstruments(); instruments != nil {
+			instruments.RecordPollAccount(accountCtx, telemetry.ProviderAppleMusic, outcome)
+		}
+		if err != nil {
 			s.logger.Printf("error processing user %d: %v", u.ID, err)
+			processErrors = append(processErrors, err)
 		}
 	}
+	return len(users), errors.Join(processErrors...)
 }

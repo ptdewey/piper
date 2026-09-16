@@ -55,6 +55,22 @@ func testService(database *db.DB, server *httptest.Server, playingNow playingNow
 	return service
 }
 
+func TestListeningTrackerStopsWhenContextIsCancelled(t *testing.T) {
+	service := NewService(testDatabase(t), "http://localhost", "piper/test", nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		service.StartListeningTracker(ctx, time.Hour)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("tracker did not stop after cancellation")
+	}
+}
+
 func TestValidateToken(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/1/validate-token" {
@@ -220,7 +236,7 @@ func TestSyncListensDeduplicatesWhenHydrationChanges(t *testing.T) {
 
 	service := testService(database, server, nil)
 	attempts := 0
-	service.hydrateTrack = func(track models.Track) (*models.Track, error) {
+	service.hydrateTrack = func(_ context.Context, track models.Track) (*models.Track, error) {
 		attempts++
 		if attempts == 1 {
 			return nil, errors.New("temporary MusicBrainz failure")

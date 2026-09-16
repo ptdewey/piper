@@ -78,6 +78,40 @@ func TestFailedSubmissionSurvivesRestartAndRetriesOriginalRecord(t *testing.T) {
 	}
 }
 
+func TestCancelledPublicationStillRecordsFailure(t *testing.T) {
+	database, err := db.New(filepath.Join(t.TempDir(), "piper.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	uid, err := database.CreateUser(&models.User{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := database.SaveTrack(uid, db.SourceListenBrainz, &models.Track{Name: "Cancelled", HasStamped: true, Timestamp: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	err = publishStoredPlay(ctx, database, uid, id, func(context.Context, *models.User, string, *teal.FeedPlay) error {
+		cancel()
+		return context.Canceled
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("publish error = %v", err)
+	}
+	plays, err := database.ListUnpublishedPlays(uid, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plays) != 1 || plays[0].Status != "failed" {
+		t.Fatalf("cancelled publication not finalized: %+v", plays)
+	}
+}
+
 func TestCreatePlayRecordVerifiesAmbiguousWrite(t *testing.T) {
 	for _, matches := range []bool{true, false} {
 		t.Run(fmt.Sprint(matches), func(t *testing.T) {

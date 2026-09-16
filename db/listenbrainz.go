@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -11,16 +12,24 @@ import (
 
 // HasListenBrainzTrack checks the immutable identity captured from the source payload.
 func (db *DB) HasListenBrainzTrack(userID int64, sourceIdentity string) (bool, error) {
+	return db.HasListenBrainzTrackContext(context.Background(), userID, sourceIdentity)
+}
+
+func (db *DB) HasListenBrainzTrackContext(ctx context.Context, userID int64, sourceIdentity string) (bool, error) {
 	var exists bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM tracks WHERE user_id = ? AND source = ? AND source_identity = ?)`, userID, SourceListenBrainz, sourceIdentity).Scan(&exists)
+	err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tracks WHERE user_id = ? AND source = ? AND source_identity = ?)`, userID, SourceListenBrainz, sourceIdentity).Scan(&exists)
 	return exists, err
 }
 
 func (db *DB) SaveListenBrainzTrack(userID int64, sourceIdentity string, track *models.Track) (int64, error) {
+	return db.SaveListenBrainzTrackContext(context.Background(), userID, sourceIdentity, track)
+}
+
+func (db *DB) SaveListenBrainzTrackContext(ctx context.Context, userID int64, sourceIdentity string, track *models.Track) (int64, error) {
 	if sourceIdentity == "" {
 		return 0, errors.New("ListenBrainz source identity is required")
 	}
-	return db.saveTrack(userID, SourceListenBrainz, track, &sourceIdentity)
+	return db.saveTrackContext(ctx, userID, SourceListenBrainz, track, &sourceIdentity)
 }
 
 func (db *DB) LinkListenBrainz(userID int64, username, token string) error {
@@ -51,7 +60,11 @@ func (db *DB) ClearListenBrainz(userID int64) error {
 }
 
 func (db *DB) GetAllUsersWithListenBrainz() ([]*models.User, error) {
-	rows, err := db.Query(`
+	return db.GetAllUsersWithListenBrainzContext(context.Background())
+}
+
+func (db *DB) GetAllUsersWithListenBrainzContext(ctx context.Context) ([]*models.User, error) {
+	rows, err := db.QueryContext(ctx, `
 	SELECT id, atproto_did, most_recent_at_session_id, listenbrainz_username,
 	       listenbrainz_token, listenbrainz_synced_at
 	FROM users
@@ -107,8 +120,12 @@ func (db *DB) GetUserByListenBrainz(username string) (*models.User, error) {
 }
 
 func (db *DB) SaveListenBrainzSyncTimestamp(userID int64, timestamp time.Time) error {
+	return db.SaveListenBrainzSyncTimestampContext(context.Background(), userID, timestamp)
+}
+
+func (db *DB) SaveListenBrainzSyncTimestampContext(ctx context.Context, userID int64, timestamp time.Time) error {
 	timestamp = timestamp.UTC()
-	_, err := db.Exec(`
+	_, err := db.ExecContext(ctx, `
 	UPDATE users
 	SET listenbrainz_synced_at = CASE
 	        WHEN listenbrainz_synced_at IS NULL OR listenbrainz_synced_at < ? THEN ?

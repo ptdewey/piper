@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
@@ -358,9 +359,13 @@ func (db *DB) ClearSpotifySession(userID int64) error {
 }
 
 func (db *DB) GetUserByID(ID int64) (*models.User, error) {
+	return db.GetUserByIDContext(context.Background(), ID)
+}
+
+func (db *DB) GetUserByIDContext(ctx context.Context, ID int64) (*models.User, error) {
 	user := &models.User{}
 
-	err := db.QueryRow(`
+	err := db.QueryRowContext(ctx, `
     SELECT id, 
            username,
            email,
@@ -472,7 +477,11 @@ func (db *DB) ClearAppleMusicUserToken(userID int64) error {
 
 // GetAllAppleMusicLinkedUsers returns users who have an Apple Music user token set
 func (db *DB) GetAllAppleMusicLinkedUsers() ([]*models.User, error) {
-	rows, err := db.Query(`
+	return db.GetAllAppleMusicLinkedUsersContext(context.Background())
+}
+
+func (db *DB) GetAllAppleMusicLinkedUsersContext(ctx context.Context) ([]*models.User, error) {
+	rows, err := db.QueryContext(ctx, `
         SELECT id, username, email, atproto_did, most_recent_at_session_id,
                spotify_id, access_token, refresh_token, token_expiry,
                lastfm_username, applemusic_user_token, created_at, updated_at
@@ -508,10 +517,18 @@ func (db *DB) GetAllAppleMusicLinkedUsers() ([]*models.User, error) {
 }
 
 func (db *DB) SaveTrack(userID int64, source TrackSource, track *models.Track) (int64, error) {
-	return db.saveTrack(userID, source, track, nil)
+	return db.SaveTrackContext(context.Background(), userID, source, track)
+}
+
+func (db *DB) SaveTrackContext(ctx context.Context, userID int64, source TrackSource, track *models.Track) (int64, error) {
+	return db.saveTrackContext(ctx, userID, source, track, nil)
 }
 
 func (db *DB) saveTrack(userID int64, source TrackSource, track *models.Track, sourceIdentity *string) (int64, error) {
+	return db.saveTrackContext(context.Background(), userID, source, track, sourceIdentity)
+}
+
+func (db *DB) saveTrackContext(ctx context.Context, userID int64, source TrackSource, track *models.Track, sourceIdentity *string) (int64, error) {
 	if !source.IsValid() {
 		return 0, fmt.Errorf("invalid source %q", source)
 	}
@@ -527,12 +544,12 @@ func (db *DB) saveTrack(userID int64, source TrackSource, track *models.Track, s
 	}
 
 	var trackID int64
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	err = tx.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 	INSERT INTO tracks (user_id, name, recording_mbid, artist, album, release_mbid, url, timestamp, duration_ms, progress_ms, service_base_url, isrc, has_stamped, source, source_identity)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	RETURNING id`,
@@ -548,7 +565,7 @@ func (db *DB) saveTrack(userID int64, source TrackSource, track *models.Track, s
 			return 0, err
 		}
 		rkey := syntax.NewTIDNow(uint(binary.BigEndian.Uint16(clockBytes[:]) & 1023)).String()
-		if _, err := tx.Exec(`INSERT INTO play_submissions(track_id,rkey) VALUES (?,?)`, trackID, rkey); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO play_submissions(track_id,rkey) VALUES (?,?)`, trackID, rkey); err != nil {
 			return 0, err
 		}
 	}

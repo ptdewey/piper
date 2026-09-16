@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -69,7 +70,11 @@ func (db *DB) ListUnpublishedPlays(userID int64, limit, offset int) ([]PlaySubmi
 }
 
 func (db *DB) GetTrackForUser(userID, trackID int64) (*models.Track, error) {
-	return scanTrack(db.QueryRow(`SELECT id, name, recording_mbid, artist, album, release_mbid, url,
+	return db.GetTrackForUserContext(context.Background(), userID, trackID)
+}
+
+func (db *DB) GetTrackForUserContext(ctx context.Context, userID, trackID int64) (*models.Track, error) {
+	return scanTrack(db.QueryRowContext(ctx, `SELECT id, name, recording_mbid, artist, album, release_mbid, url,
  timestamp, duration_ms, progress_ms, service_base_url, isrc, has_stamped FROM tracks WHERE id=? AND user_id=?`, trackID, userID))
 }
 
@@ -78,8 +83,12 @@ var ErrSubmissionUnavailable = errors.New("play is already published, currently 
 // ClaimSubmission uses an expiring claim so crashes do not strand plays. The
 // attempt number fences late results from an older worker after lease expiry.
 func (db *DB) ClaimSubmission(userID, trackID int64) (*PlaySubmission, error) {
+	return db.ClaimSubmissionContext(context.Background(), userID, trackID)
+}
+
+func (db *DB) ClaimSubmissionContext(ctx context.Context, userID, trackID int64) (*PlaySubmission, error) {
 	var p PlaySubmission
-	err := db.QueryRow(`UPDATE play_submissions SET status='submitting', attempts=attempts+1, last_attempt_at=?
+	err := db.QueryRowContext(ctx, `UPDATE play_submissions SET status='submitting', attempts=attempts+1, last_attempt_at=?
  WHERE track_id=? AND track_id IN (SELECT id FROM tracks WHERE user_id=?)
  AND (status IN ('pending','failed') OR (status='submitting' AND last_attempt_at < ?))
  RETURNING track_id,rkey,attempts,record_json`, time.Now().UTC(), trackID, userID, time.Now().UTC().Add(-2*time.Minute)).Scan(&p.TrackID, &p.RKey, &p.Attempts, &p.RecordJSON)
@@ -90,18 +99,26 @@ func (db *DB) ClaimSubmission(userID, trackID int64) (*PlaySubmission, error) {
 }
 
 func (db *DB) SaveSubmissionRecord(p *PlaySubmission, record string) error {
-	res, err := db.Exec(`UPDATE play_submissions SET record_json=? WHERE track_id=? AND attempts=? AND status='submitting'`, record, p.TrackID, p.Attempts)
+	return db.SaveSubmissionRecordContext(context.Background(), p, record)
+}
+
+func (db *DB) SaveSubmissionRecordContext(ctx context.Context, p *PlaySubmission, record string) error {
+	res, err := db.ExecContext(ctx, `UPDATE play_submissions SET record_json=? WHERE track_id=? AND attempts=? AND status='submitting'`, record, p.TrackID, p.Attempts)
 	return submissionUpdated(res, err)
 }
 
 func (db *DB) FinishSubmission(p *PlaySubmission, message string) error {
+	return db.FinishSubmissionContext(context.Background(), p, message)
+}
+
+func (db *DB) FinishSubmissionContext(ctx context.Context, p *PlaySubmission, message string) error {
 	status := "published"
 	var publishedAt any = time.Now().UTC()
 	if message != "" {
 		status = "failed"
 		publishedAt = nil
 	}
-	res, err := db.Exec(`UPDATE play_submissions SET status=?, last_error=?, published_at=? WHERE track_id=? AND attempts=? AND status='submitting'`, status, message, publishedAt, p.TrackID, p.Attempts)
+	res, err := db.ExecContext(ctx, `UPDATE play_submissions SET status=?, last_error=?, published_at=? WHERE track_id=? AND attempts=? AND status='submitting'`, status, message, publishedAt, p.TrackID, p.Attempts)
 	return submissionUpdated(res, err)
 }
 

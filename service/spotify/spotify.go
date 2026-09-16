@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 	atprotoauth "github.com/teal-fm/piper/oauth/atproto"
 	atprotoservice "github.com/teal-fm/piper/service/atproto"
@@ -464,7 +465,7 @@ func generateLocalHash(track *models.Track) string {
 	return fmt.Sprintf("sp_local_%x", hash)
 }
 
-func (s *Service) FetchCurrentTrack(userID int64) (*SpotifyTrackResponse, error) {
+func (s *Service) FetchCurrentTrack(ctx context.Context, userID int64) (*SpotifyTrackResponse, error) {
 	s.mu.RLock()
 	token, exists := s.userTokens[userID]
 	s.mu.RUnlock()
@@ -473,7 +474,7 @@ func (s *Service) FetchCurrentTrack(userID int64) (*SpotifyTrackResponse, error)
 		return nil, fmt.Errorf("no access token for user %d", userID)
 	}
 
-	req, rErr := http.NewRequest("GET", "https://api.spotify.com/v1/me/player/currently-playing", nil)
+	req, rErr := http.NewRequestWithContext(ctx, "GET", "https://api.spotify.com/v1/me/player/currently-playing", nil)
 	if rErr != nil {
 		return nil, rErr
 	}
@@ -732,27 +733,33 @@ func (s *Service) computeStateUpdate(userID int64, resp *SpotifyTrackResponse) s
 
 // fetchTrackForUser fetches the current track from Spotify, computes the
 // state update, and executes any required external actions.
-func (s *Service) fetchTrackForUser(ctx context.Context, userID int64) {
+func (s *Service) fetchTrackForUser(ctx context.Context, userID int64) error {
 	// Fetch from Spotify
-	resp, err := s.FetchCurrentTrack(userID)
+	fetchCtx, span := telemetry.StartSpan(ctx, telemetry.SpanProviderFetch, telemetry.ProviderSpotify, telemetry.OperationProviderFetch)
+	resp, err := s.FetchCurrentTrack(fetchCtx, userID)
+	outcome, errorType := telemetry.ClassifyError(err)
+	telemetry.EndSpan(span, outcome, errorType)
 	if err != nil {
 		s.logger.Printf("Error fetching track for user %d: %v", userID, err)
-		return
+		return err
 	}
 
 	// Compute state changes (holds lock internally)
 	action := s.computeStateUpdate(userID, resp)
 
 	// Execute external calls based on computed actions (no lock held)
+	var actionErrors []error
 	if action.clearNowPlaying && s.playingNowService != nil {
 		if err := s.playingNowService.ClearPlayingNow(ctx, userID); err != nil {
 			s.logger.Printf("Error clearing playing now for user %d: %v", userID, err)
+			actionErrors = append(actionErrors, err)
 		}
 	}
 
 	if action.publishNowPlaying && s.playingNowService != nil {
 		if err := s.playingNowService.PublishPlayingNow(ctx, userID, action.track); err != nil {
 			s.logger.Printf("Error publishing playing now for user %d: %v", userID, err)
+			actionErrors = append(actionErrors, err)
 		}
 	}
 
@@ -762,11 +769,14 @@ func (s *Service) fetchTrackForUser(ctx context.Context, userID int64) {
 			userID, action.track.Name, getFirstArtist(action.track),
 			action.accumulatedMs, action.track.DurationMs,
 		)
-		s.stampTrack(ctx, userID, action.track)
+		if err := s.stampTrack(ctx, userID, action.track); err != nil {
+			actionErrors = append(actionErrors, err)
+		}
 	}
+	return errors.Join(actionErrors...)
 }
 
-func (s *Service) fetchAllUserTracks(ctx context.Context) {
+func (s *Service) fetchAllUserTracks(ctx context.Context) error {
 	// evict play states that have been idle for over a day; states must
 	// survive across poll cycles, so only long-stale entries are removed
 	staleCutoff := time.Now().Add(-24 * time.Hour)
@@ -786,24 +796,41 @@ func (s *Service) fetchAllUserTracks(ctx context.Context) {
 	}
 	s.mu.RUnlock()
 
+	var fetchErrors []error
 	for _, userID := range userIDs {
 		if ctx.Err() != nil {
 			s.logger.Printf("Context cancelled before starting fetch for user id %d.", userID)
+			fetchErrors = append(fetchErrors, ctx.Err())
 			break // Exit loop if context is cancelled
 		}
 
-		s.fetchTrackForUser(ctx, userID)
+		accountCtx, span := telemetry.StartSpan(ctx, telemetry.SpanPollAccount, telemetry.ProviderSpotify, telemetry.OperationPollAccount)
+		err := s.fetchTrackForUser(accountCtx, userID)
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+		if instruments := telemetry.DefaultInstruments(); instruments != nil {
+			instruments.RecordPollAccount(accountCtx, telemetry.ProviderSpotify, outcome)
+		}
+		if err != nil {
+			fetchErrors = append(fetchErrors, err)
+		}
 	}
+	return errors.Join(fetchErrors...)
 }
 
 // stampTrack handles MusicBrainz hydration, DB save, and PDS submission for a stamped track.
-func (s *Service) stampTrack(ctx context.Context, userID int64, track *models.Track) {
+func (s *Service) stampTrack(ctx context.Context, userID int64, track *models.Track) error {
 	track.HasStamped = true
 
 	trackToSubmit := track
+	var hydrationErr error
 	if s.mb != nil {
-		hydratedTrack, err := musicbrainz.HydrateTrack(s.mb, *track)
+		hydrateCtx, span := telemetry.StartSpan(ctx, telemetry.SpanMusicBrainzHydrate, telemetry.ProviderSpotify, telemetry.OperationHydrate)
+		hydratedTrack, err := musicbrainz.HydrateTrack(hydrateCtx, s.mb, *track)
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
 		if err != nil {
+			hydrationErr = err
 			s.logger.Printf("User %d: Error hydrating track '%s' with MusicBrainz: %v", userID, track.Name, err)
 		} else {
 			s.logger.Printf("User %d: Successfully hydrated track '%s'", userID, track.Name)
@@ -812,57 +839,76 @@ func (s *Service) stampTrack(ctx context.Context, userID int64, track *models.Tr
 	}
 
 	// Save the track now that it is stamped and hydrated
-	if _, err := s.DB.SaveTrack(userID, db.SourceSpotify, trackToSubmit); err != nil {
+	persistCtx, span := telemetry.StartSpan(ctx, telemetry.SpanDBPersistPlay, telemetry.ProviderSpotify, telemetry.OperationPersistPlay)
+	_, err := s.DB.SaveTrackContext(persistCtx, userID, db.SourceSpotify, trackToSubmit)
+	outcome, errorType := telemetry.ClassifyError(err)
+	telemetry.EndSpan(span, outcome, errorType)
+	if err != nil {
 		s.logger.Printf("Error saving track for user %d: %v", userID, err)
-		return
+		return errors.Join(hydrationErr, err)
 	}
 
 	if err := atprotoservice.PublishStoredPlay(ctx, s.DB, userID, trackToSubmit.PlayID, s.atprotoAuthService); err != nil {
 		s.logger.Printf("User %d: Error submitting to PDS: %v", userID, err)
+		return errors.Join(hydrationErr, err)
 	}
+	return hydrationErr
 }
 
-func (s *Service) StartListeningTracker(interval time.Duration) {
+func (s *Service) StartListeningTracker(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
 	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	go func() {
+	runOnce := func() {
+		cycleCtx := telemetry.WithProvider(ctx, telemetry.ProviderSpotify)
+		cycleCtx, span := telemetry.StartSpan(cycleCtx, telemetry.SpanPollCycle, telemetry.ProviderSpotify, telemetry.OperationPollCycle)
+		started := time.Now()
+		var cycleErr error
+		userCount := 0
+		outcome := telemetry.OutcomeSuccess
+		defer func() {
+			if cycleErr != nil {
+				outcome, _ = telemetry.ClassifyError(cycleErr)
+			} else if userCount == 0 {
+				outcome = telemetry.OutcomeEmpty
+			}
+			_, errorType := telemetry.ClassifyError(cycleErr)
+			telemetry.EndSpan(span, outcome, errorType)
+			if instruments := telemetry.DefaultInstruments(); instruments != nil {
+				instruments.RecordPollCycle(cycleCtx, telemetry.ProviderSpotify, outcome, time.Since(started))
+			}
+		}()
 		if err := s.LoadAllUsers(); err != nil {
+			cycleErr = err
 			s.logger.Printf("Error loading spotify users: %v", err)
+			return
 		}
+		userCount = len(s.userTokens)
 
 		if len(s.userTokens) > 0 {
-			s.fetchAllUserTracks(context.Background())
+			cycleErr = s.fetchAllUserTracks(cycleCtx)
 		} else {
 			s.logger.Printf("No users to fetch tracks for.")
 		}
 
 		//unloading users to save memory and make sure we get new signups
-		err := s.UnloadAllUsers()
-		if err != nil {
+		if err := s.UnloadAllUsers(); err != nil {
 			log.Printf("Error loading spotify users: %v", err)
 		}
+	}
 
-		for range ticker.C {
+	runOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			s.logger.Printf("Fetching tracks...")
-			err := s.LoadAllUsers()
-			if err != nil {
-				s.logger.Printf("Error loading spotify users: %v", err)
-				continue
-			}
-			if len(s.userTokens) > 0 {
-				s.fetchAllUserTracks(context.Background())
-			} else {
-				s.logger.Printf("No users to fetch tracks for.")
-				continue
-			}
-			//unloading users to save memory and make sure we get new signups
-			err = s.UnloadAllUsers()
-			if err != nil {
-				log.Printf("Error loading spotify users: %v", err)
-			}
-			s.logger.Printf("Finished fetch cycle suscessfully.")
-
+			runOnce()
+			s.logger.Printf("Finished fetch cycle successfully.")
 		}
-	}()
-
+	}
 }

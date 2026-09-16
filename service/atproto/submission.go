@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/viper"
 	"github.com/teal-fm/piper/api/teal"
 	"github.com/teal-fm/piper/db"
+	"github.com/teal-fm/piper/internal/telemetry"
 	"github.com/teal-fm/piper/models"
 	atprotoauth "github.com/teal-fm/piper/oauth/atproto"
 )
@@ -41,15 +42,25 @@ func PublishStoredPlay(ctx context.Context, database *db.DB, userID, trackID int
 
 type playPublisher func(context.Context, *models.User, string, *teal.FeedPlay) error
 
-func publishStoredPlay(ctx context.Context, database *db.DB, userID, trackID int64, publish playPublisher) error {
-	p, err := database.ClaimSubmission(userID, trackID)
+func publishStoredPlay(ctx context.Context, database *db.DB, userID, trackID int64, publish playPublisher) (err error) {
+	provider := telemetry.ProviderFromContext(ctx)
+	ctx, span := telemetry.StartSpan(ctx, telemetry.SpanATProtoPublishPlay, provider, telemetry.OperationPublishPlay)
+	defer func() {
+		outcome, errorType := telemetry.ClassifyError(err)
+		telemetry.EndSpan(span, outcome, errorType)
+		if instruments := telemetry.DefaultInstruments(); instruments != nil {
+			instruments.RecordPublication(ctx, provider, outcome)
+		}
+	}()
+
+	p, err := database.ClaimSubmissionContext(ctx, userID, trackID)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	err = func() error {
-		user, err := database.GetUserByID(userID)
+		user, err := database.GetUserByIDContext(ctx, userID)
 		if err != nil {
 			return errors.New("Could not load the publishing account.")
 		}
@@ -62,7 +73,7 @@ func publishStoredPlay(ctx context.Context, database *db.DB, userID, trackID int
 				return errors.New("Could not read saved play record.")
 			}
 		} else {
-			track, err := database.GetTrackForUser(userID, trackID)
+			track, err := database.GetTrackForUserContext(ctx, userID, trackID)
 			if err != nil {
 				return errors.New("Could not load saved play.")
 			}
@@ -74,7 +85,7 @@ func publishStoredPlay(ctx context.Context, database *db.DB, userID, trackID int
 			if err != nil {
 				return errors.New("Could not encode saved play.")
 			}
-			if err := database.SaveSubmissionRecord(p, string(encoded)); err != nil {
+			if err := database.SaveSubmissionRecordContext(ctx, p, string(encoded)); err != nil {
 				return errors.New("Could not save publishing record.")
 			}
 		}
@@ -84,7 +95,9 @@ func publishStoredPlay(ctx context.Context, database *db.DB, userID, trackID int
 	if err != nil {
 		message = err.Error()
 	}
-	if saveErr := database.FinishSubmission(p, message); saveErr != nil {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cleanupCancel()
+	if saveErr := database.FinishSubmissionContext(cleanupCtx, p, message); saveErr != nil {
 		log.Printf("play_submission user_id=%d play_id=%d attempt=%d outcome=persistence_failed error=%q", userID, trackID, p.Attempts, saveErr)
 		return fmt.Errorf("saving publishing outcome: %w", saveErr)
 	}
